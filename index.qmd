@@ -1,0 +1,403 @@
+---
+title: "Geographic Disparities in Mental Health Care Access"
+subtitle: "A county-level analysis of availability and affordability across California"
+author: "Pallavi Singh"
+date: today
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    toc-title: "Contents"
+    code-fold: true
+    code-tools: true
+    smooth-scroll: true
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(scales)
+library(ggrepel)
+library(tigris)
+library(sf)
+library(viridis)
+library(patchwork)
+library(gt)
+library(plotly)
+
+options(tigris_use_cache = TRUE)
+theme_set(theme_minimal(base_size = 13))
+
+pal <- c(Urban = "#2563EB", Micropolitan = "#F59E0B", Rural = "#059669")
+```
+
+## Overview
+
+Mental health care in California isn't just scarce — it's unevenly scarce. A provider might be listed in San Francisco at $200 a session and in a rural county at $168, but the rural patient has a fraction of the income. That gap between what care costs and what people can actually pay is what this analysis is about.
+
+Using the [Two Dimensions of Access dataset](https://osf.io/6ezrx) — which draws on Psychology Today provider listings across U.S. counties — this analysis examines two dimensions of access across California's 58 counties:
+
+- **Availability (AVI):** How many providers exist per 100,000 residents
+- **Affordability (AFI):** What 10 therapy sessions costs as a share of disposable income
+
+The findings challenge a common assumption: that rural areas struggle only with availability. In California, rural counties have the highest median fees *and* the lowest incomes — making affordability the sharper edge of the access problem.
+
+---
+
+## Data & Methods
+
+```{r load-data}
+# Update this path to your local copy of the OSF dataset
+# Download from: https://osf.io/6ezrx
+DATA_PATH <- here::here("data", "Two Dimension of access.csv")
+
+raw <- read_csv(DATA_PATH, show_col_types = FALSE)
+cat("Full dataset:", nrow(raw), "rows ×", ncol(raw), "columns\n")
+```
+
+```{r prepare-california}
+ca_all <- raw |>
+  filter(State == "CA") |>
+  mutate(
+    urban_rural = case_when(
+      UIC_2024 %in% 1:4 ~ "Urban",
+      UIC_2024 %in% 5:6 ~ "Micropolitan",
+      UIC_2024 %in% 7:9 ~ "Rural"
+    ),
+    urban_rural = factor(urban_rural, levels = c("Urban", "Micropolitan", "Rural")),
+    fips = str_pad(as.character(county_fips_str), 5, pad = "0"),
+    fee_burden = if_else(
+      !is.na(median_fee) & !is.na(disposable_income) & disposable_income > 0,
+      (median_fee * 10) / disposable_income * 100,
+      NA_real_
+    ),
+    afi_wins = AFI_county_wins_05,
+    avi      = AVI_county
+  )
+
+ca <- ca_all |> filter(!is.na(median_fee))
+
+# Reference values
+national_median_fee <- median(raw$median_fee, na.rm = TRUE)
+national_no_prov    <- mean(is.na(raw$median_fee)) * 100
+
+cat("California counties (total):", nrow(ca_all), "\n")
+cat("Provider counties:", nrow(ca), "\n")
+cat("Excluded (no provider):", nrow(ca_all) - nrow(ca), "\n")
+cat("National median fee: $", national_median_fee, "\n")
+```
+
+**Sample:** 57 of California's 58 counties have at least one listed provider. The one excluded county is identified in the reproducibility check at the end.
+
+**Fee burden** is calculated as: `(median session fee × 10) / disposable income × 100`. This represents the share of annual disposable income a resident would spend on ten therapy sessions — a commonly used threshold for a basic course of treatment.
+
+---
+
+## Insight 1 — The Affordability Paradox
+
+Rural counties charge the highest median session fee ($167.50) despite having the lowest disposable incomes. The result is that the 10-session burden in non-urban counties (4.9%) is meaningfully higher than in urban ones (3.8%) — even though the absolute fee difference is modest.
+
+```{r insight1-summary}
+fee_summary <- ca |>
+  group_by(urban_rural) |>
+  summarise(
+    n              = n(),
+    median_fee     = median(median_fee, na.rm = TRUE),
+    median_income  = median(disposable_income, na.rm = TRUE),
+    mean_burden    = mean(fee_burden, na.rm = TRUE),
+    median_avi     = median(avi, na.rm = TRUE),
+    mean_medicaid  = mean(pct_medicaid, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(across(where(is.numeric), \(x) round(x, 1)))
+```
+
+```{r table1, echo=FALSE}
+fee_summary |>
+  select(urban_rural, median_fee, median_income, mean_burden,
+         mean_medicaid, median_avi) |>
+  rename(
+    "Type"                = urban_rural,
+    "Median Fee ($)"      = median_fee,
+    "Median Income ($)"   = median_income,
+    "Avg Burden (%)"      = mean_burden,
+    "Medicaid Accept (%)" = mean_medicaid,
+    "Median AVI"          = median_avi
+  ) |>
+  gt() |>
+  tab_header(
+    title    = "Table 1. Financial Access Metrics by Urban-Rural Type",
+    subtitle = "California provider counties only (n = 57)"
+  ) |>
+  fmt_currency(columns = 2:3, decimals = 0) |>
+  fmt_number(columns = 4:5, decimals = 1, suffix = "%") |>
+  fmt_number(columns = 6, decimals = 1) |>
+  tab_source_note("Source: Two Dimensions of Access dataset (OSF, 2024–2025)")
+```
+
+The paradox here isn't subtle. A rural patient paying $167.50 per session on $34,000 of disposable income is in a structurally worse position than an urban patient paying $175 on $52,000. Fee comparisons alone obscure this.
+
+---
+
+## Insight 2 — The Medicaid Metro Gap
+
+Urban areas dominate provider counts, but their Medicaid acceptance rate is just **1.3%** — functionally zero. Micropolitan counties, despite having far fewer providers in total, accept Medicaid at a rate ten times higher (13.0%).
+
+```{r insight2-chart, fig.width=9, fig.height=5.5}
+ins_summary <- ca |>
+  group_by(urban_rural) |>
+  summarise(
+    Insurance = mean(pct_insurance_acceptance, na.rm = TRUE),
+    Medicaid  = mean(pct_medicaid, na.rm = TRUE),
+    Sliding   = mean(pct_sliding_scale, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(across(where(is.numeric), \(x) round(x, 1)))
+
+ins_long <- ins_summary |>
+  pivot_longer(-urban_rural, names_to = "Metric", values_to = "pct") |>
+  mutate(Metric = factor(Metric, levels = c("Insurance", "Medicaid", "Sliding")))
+
+p_ins <- ggplot(ins_long, aes(x = urban_rural, y = pct, fill = Metric)) +
+  geom_col(position = position_dodge(0.75), width = 0.65,
+           colour = "white", linewidth = 0.3) +
+  geom_text(
+    aes(label = paste0(round(pct, 1), "%")),
+    position = position_dodge(0.75), vjust = -0.4,
+    size = 3.5, fontface = "bold"
+  ) +
+  scale_fill_manual(
+    values = c(Insurance = "#2563EB", Medicaid = "#DC2626", Sliding = "#7C3AED"),
+    name = NULL
+  ) +
+  scale_y_continuous(
+    labels = \(x) paste0(x, "%"),
+    limits = c(0, 80), expand = c(0, 0)
+  ) +
+  labs(
+    title    = "Figure 1. Insurance, Medicaid & Sliding-Scale Acceptance",
+    subtitle = "California provider counties. Urban Medicaid acceptance is 1.3%.",
+    x = NULL, y = "Acceptance Rate (%)",
+    caption  = "Source: Two Dimensions of Access dataset, 2024–2025"
+  ) +
+  theme(
+    plot.title         = element_text(face = "bold"),
+    plot.subtitle      = element_text(colour = "grey40"),
+    legend.position    = "bottom",
+    panel.grid.major.x = element_blank()
+  )
+
+ggplotly(p_ins, tooltip = c("x", "fill", "y")) |>
+  layout(legend = list(orientation = "h", y = -0.2))
+```
+
+This matters for policy: Medicaid expansion and network adequacy rules are most often applied to urban markets, where uptake is already the lowest.
+
+---
+
+## Insight 3 — Fee Burden vs. Income
+
+The scatter plot below shows every California provider county. The 10-session burden ranges from under 2% in high-income urban counties to nearly **10% in Sierra County** — where a low income collides with above-average fees.
+
+```{r insight3-scatter, fig.width=10, fig.height=6.5}
+top5 <- ca |>
+  filter(!is.na(fee_burden)) |>
+  slice_max(fee_burden, n = 5)
+
+plot_ly(
+  data = ca |> filter(!is.na(fee_burden)),
+  x = ~disposable_income,
+  y = ~fee_burden,
+  color = ~urban_rural,
+  colors = pal,
+  type  = "scatter",
+  mode  = "markers",
+  marker = list(size = 10, opacity = 0.7),
+  text = ~paste0(
+    "<b>", County_Name, "</b><br>",
+    "Income: $", format(round(disposable_income), big.mark = ","), "<br>",
+    "Burden: ", round(fee_burden, 1), "%<br>",
+    "Fee: $", round(median_fee, 0)
+  ),
+  hoverinfo = "text"
+) |>
+  add_annotations(
+    data = top5,
+    x    = ~disposable_income,
+    y    = ~fee_burden,
+    text = ~County_Name,
+    showarrow  = TRUE,
+    arrowhead  = 2,
+    arrowsize  = 0.8,
+    arrowcolor = "grey40",
+    ax   = 30,
+    ay   = -35,
+    font = list(size = 11, color = "grey20")
+  ) |>
+  layout(
+    title = list(
+      text = "Figure 2. 10-Session Therapy Burden vs. Disposable Income",
+      font = list(size = 14)
+    ),
+    xaxis = list(title = "Disposable Income ($)", tickformat = "$,.0f"),
+    yaxis = list(title = "10-Session Burden (% of Income)", ticksuffix = "%"),
+    legend = list(orientation = "h", y = -0.2),
+    hoverlabel = list(bgcolor = "white")
+  )
+```
+
+Counties below $25,000 in disposable income consistently spend 6–10% of that income on a basic course of therapy. Hover over any point to see county-level detail.
+
+---
+
+## Insight 4 — Access Deserts (Maps)
+
+The choropleth maps below show where availability and affordability break down geographically. Gray counties have no listed provider.
+
+```{r maps, fig.width=14, fig.height=8, message=FALSE}
+ca_sf <- counties(state = "CA", cb = TRUE, resolution = "5m", year = 2022) |>
+  st_transform(4326)
+
+ca_map <- ca_sf |>
+  left_join(
+    ca_all |> select(fips, urban_rural, avi, afi_wins, fee_burden,
+                     median_fee, disposable_income, pct_medicaid),
+    by = c("GEOID" = "fips")
+  ) |>
+  mutate(
+    has_provider = !is.na(median_fee),
+    avi_plot     = if_else(has_provider, avi, NA_real_),
+    afi_plot     = if_else(has_provider, afi_wins, NA_real_)
+  )
+
+p_avi <- ggplot(ca_map) +
+  geom_sf(aes(fill = avi_plot), colour = "white", linewidth = 0.25) +
+  scale_fill_distiller(
+    palette = "Blues", direction = 1, na.value = "#E5E7EB",
+    name = "AVI\n(per 100K)",
+    labels = number_format(accuracy = 1)
+  ) +
+  labs(
+    title    = "Availability Index (AVI)",
+    subtitle = "Darker = more providers per capita. Gray = no listed provider."
+  ) +
+  theme_void(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(colour = "grey40", hjust = 0.5, size = 9)
+  )
+
+p_afi <- ggplot(ca_map) +
+  geom_sf(aes(fill = afi_plot), colour = "white", linewidth = 0.25) +
+  scale_fill_distiller(
+    palette = "Oranges", direction = 1, na.value = "#E5E7EB",
+    name = "AFI\n(% income)",
+    labels = \(x) paste0(round(x, 1), "%")
+  ) +
+  labs(
+    title    = "Affordability Index (AFI)",
+    subtitle = "Darker = higher burden. Winsorised at 95th percentile."
+  ) +
+  theme_void(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(colour = "grey40", hjust = 0.5, size = 9)
+  )
+
+(p_avi + p_afi) +
+  plot_annotation(
+    title   = "Figure 3. California Mental Health Access by County",
+    caption = "Source: Two Dimensions of Access dataset, 2024–2025",
+    theme   = theme(
+      plot.title   = element_text(face = "bold", size = 14, hjust = 0.5),
+      plot.caption = element_text(colour = "grey50")
+    )
+  )
+```
+
+Access deserts cluster in the northern interior and parts of the Central Valley — precisely the counties with the lowest incomes and fewest alternative resources.
+
+---
+
+## Insight 5 — Provider Availability Distribution
+
+```{r avi-boxplot, fig.width=8, fig.height=5.5}
+p_avi_box <- ggplot(ca, aes(x = urban_rural, y = avi, fill = urban_rural)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = 21, outlier.size = 2) +
+  geom_jitter(width = 0.15, alpha = 0.4, size = 2,
+              aes(colour = urban_rural)) +
+  scale_fill_manual(values = pal) +
+  scale_colour_manual(values = pal) +
+  labs(
+    title    = "Figure 4. Provider Availability by Urban-Rural Type",
+    subtitle = "Micropolitan counties have the lowest median AVI.",
+    x = NULL, y = "AVI (providers per 100,000)",
+    caption  = "Source: Two Dimensions of Access dataset, 2024–2025"
+  ) +
+  theme(
+    plot.title    = element_text(face = "bold"),
+    plot.subtitle = element_text(colour = "grey40"),
+    legend.position = "none"
+  )
+
+ggplotly(p_avi_box, tooltip = c("y", "x")) |>
+  layout(showlegend = FALSE)
+```
+
+Micropolitan counties — mid-sized towns not classified as urban — have the lowest median AVI. This suggests a trough effect: rural counties sometimes benefit from small-town practitioners, while micropolitan areas fall between the coverage of urban networks and the self-sufficiency of rural generalists.
+
+---
+
+## Reproducibility Check
+
+```{r repro-check}
+cat("CA total counties:            ", nrow(ca_all), "\n")
+cat("CA provider counties:         ", nrow(ca), "\n")
+cat("CA excluded (no provider):    ", nrow(ca_all) - nrow(ca), "\n")
+
+excluded <- ca_all |> filter(is.na(median_fee))
+cat("Excluded county:              ", excluded$County_Name,
+    "(pop", format(excluded$population, big.mark = ","),
+    ", UIC", excluded$UIC_2024, ")\n")
+
+cat("CA median session fee:        $", median(ca$median_fee, na.rm = TRUE), "\n")
+cat("National median session fee:  $", national_median_fee, "\n")
+cat("CA fee premium:               ",
+    round((median(ca$median_fee, na.rm = TRUE) / national_median_fee - 1) * 100, 0), "%\n")
+cat("Urban Medicaid acceptance:    ",
+    round(mean(ca$pct_medicaid[ca$urban_rural == "Urban"], na.rm = TRUE), 1), "%\n")
+cat("Micro Medicaid acceptance:    ",
+    round(mean(ca$pct_medicaid[ca$urban_rural == "Micropolitan"], na.rm = TRUE), 1), "%\n")
+cat("Rural Medicaid acceptance:    ",
+    round(mean(ca$pct_medicaid[ca$urban_rural == "Rural"], na.rm = TRUE), 1), "%\n")
+cat("Max burden county:            ",
+    ca |> filter(!is.na(fee_burden)) |>
+      slice_max(fee_burden, n = 1) |> pull(County_Name),
+    "(",
+    ca |> filter(!is.na(fee_burden)) |>
+      slice_max(fee_burden, n = 1) |> pull(fee_burden) |> round(1), "%)\n")
+```
+
+---
+
+## Data Source
+
+**Two Dimensions of Access** (OSF, v1.0, January 2026)  
+Provider data sourced from the Psychology Today therapist directory.  
+Dataset available at: [https://osf.io/6ezrx](https://osf.io/6ezrx)
+
+To reproduce this analysis:
+
+1. Download the dataset from OSF
+2. Place the CSV in a `data/` folder in this project directory
+3. Run `quarto render index.qmd`
+
+---
+
+```{r session-info, code-fold=true}
+sessionInfo()
+```
