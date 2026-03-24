@@ -1,220 +1,188 @@
-# =============================================================================
-# Mental Health Care Access — California Counties
+# ============================================================================
+# Geographic Disparities in Mental Health Care Access Across California Counties
+# Two Dimensions of Access dataset (OSF, v1.0, January 2026)
+#
 # Author: Pallavi Singh
-# Data:   Two Dimensions of Access (OSF, v1.0, Jan 2026) | osf.io/6ezrx
-# =============================================================================
-# Place the dataset CSV in data/ before running.
-# Output figures are saved to figures/ (created automatically).
-# =============================================================================
+# Date:   2026
+#
+# Findings and interpretations are solely the author's own and do not
+# represent any employer or affiliated organization.
+# ============================================================================
 
+# ── 0. Dependencies ──────────────────────────────────────────────────────────
 library(tidyverse)
-library(here)
-library(ggrepel)
 library(scales)
+library(janitor)
 
-# ── Load data ──────────────────────────────────────────────────────────────────
-df_raw <- read_csv(here("data", "Two Dimension of access.csv"), show_col_types = FALSE)
+# Optional: spatial mapping
+# library(sf)
+# library(tigris)   # TIGER/Line shapefiles for CA counties
 
-# ── Filter to California, drop Modoc (no providers) ───────────────────────────
-df <- df_raw |>
-  filter(state_abbr == "CA") |>
-  filter(!is.na(AVI_county)) |>
-  filter(county_name != "Modoc County")  # 0 listed providers — excluded
 
-# ── Classify rurality (USDA UIC 2024) ─────────────────────────────────────────
-df <- df |>
+# ── 1. Load Data ─────────────────────────────────────────────────────────────
+# Source: Two Dimensions of Access (OSF, v1.0, Jan 2026)
+# Replace the path below with your local data file location.
+# Expected columns (see OSF codebook for full variable list):
+#   county, urban_rural_class, n_providers, population,
+#   median_fee, disposable_income, pct_medicaid, pct_sliding_scale,
+#   avi, afi
+
+raw <- read_csv("data/two_dimensions_of_access_v1.csv") |>
+  clean_names()
+
+# ── 2. Data Cleaning & Derivations ───────────────────────────────────────────
+
+df <- raw |>
+  # Exclude Modoc County (no listed providers; micropolitan, pop. 8,491)
+  filter(county != "Modoc County") |>
   mutate(
-    rurality = case_when(
-      UIC_2024 %in% c("1","2","3","4") ~ "Urban",
-      UIC_2024 %in% c("5","6")         ~ "Micropolitan",
-      TRUE                              ~ "Rural"
-    ),
-    rurality = factor(rurality, levels = c("Urban", "Micropolitan", "Rural"))
+    # Urban–rural classification (recoded to 3 levels for display)
+    urban_rural = case_when(
+      urban_rural_class == "Urban"          ~ "Urban",
+      urban_rural_class == "Micropolitan"   ~ "Micro",
+      urban_rural_class == "Rural"          ~ "Rural",
+      TRUE                                  ~ NA_character_
+    ) |> factor(levels = c("Urban", "Micro", "Rural")),
+
+    # 10-session fee burden as % of disposable income
+    burden_10sess_pct = (median_fee * 10 / disposable_income) * 100,
+
+    # Access Vulnerability Index (provider density per 100K residents)
+    # AVI already present in source data; re-derive for transparency
+    avi_derived = (n_providers / population) * 100000
   )
 
-# ── Fee burden: 10 sessions as % of annual disposable income ──────────────────
-df <- df |>
+# Quick sanity check
+stopifnot(nrow(df) == 57)
+
+
+# ── 3. Summary Table (Insight 2 / Table 1) ───────────────────────────────────
+# Insight 2: Fees Are High Everywhere — But Rural Counties Pay the Most
+
+summary_by_type <- df |>
+  group_by(urban_rural) |>
+  summarise(
+    n_counties            = n(),
+    median_fee            = median(median_fee, na.rm = TRUE),
+    median_disp_income    = median(disposable_income, na.rm = TRUE),
+    avg_burden_10sess     = mean(burden_10sess_pct, na.rm = TRUE),
+    mean_pct_medicaid     = mean(pct_medicaid, na.rm = TRUE),
+    median_avi            = median(avi, na.rm = TRUE),
+    total_population      = sum(population, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
   mutate(
-    fee_burden_pct = (median_fee * 10 / disposable_income) * 100
+    across(c(median_fee, median_disp_income), dollar),
+    across(c(avg_burden_10sess, mean_pct_medicaid), ~paste0(round(.x, 1), "%")),
+    median_avi = round(median_avi, 1),
+    total_population = comma(total_population)
   )
 
-# ── Create output directory ────────────────────────────────────────────────────
-dir.create(here("figures"), showWarnings = FALSE)
+print(summary_by_type)
 
-# ── Shared theme ──────────────────────────────────────────────────────────────
-theme_mh <- function() {
+
+# ── 4. Figure 1: Insurance Acceptance by Urban–Rural Type (Insight 1) ────────
+# Insight 1: Urban Medicaid Acceptance Is Effectively Zero
+
+ins_long <- df |>
+  group_by(urban_rural) |>
+  summarise(
+    `Insurance Accepted`  = mean(pct_insurance,      na.rm = TRUE),
+    `Medicaid Accepted`   = mean(pct_medicaid,       na.rm = TRUE),
+    `Sliding Scale`       = mean(pct_sliding_scale,  na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  pivot_longer(-urban_rural, names_to = "metric", values_to = "pct")
+
+fig1 <- ggplot(ins_long, aes(x = urban_rural, y = pct, fill = metric)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.6) +
+  scale_y_continuous(labels = percent_format(scale = 1), limits = c(0, 100)) +
+  scale_fill_manual(
+    values = c(
+      "Insurance Accepted" = "#6C8EBF",
+      "Medicaid Accepted"  = "#E07B4F",
+      "Sliding Scale"      = "#82B366"
+    )
+  ) +
+  labs(
+    title    = "Insurance, Medicaid, and Sliding-Scale Acceptance by Urban–Rural Type",
+    subtitle = "Figure 1 — Provider counties only (n = 57; Modoc excluded)",
+    x        = NULL,
+    y        = "Mean Acceptance Rate (%)",
+    fill     = NULL,
+    caption  = "Source: Two Dimensions of Access (OSF, v1.0, Jan 2026)"
+  ) +
   theme_minimal(base_size = 13) +
-    theme(
-      plot.background  = element_rect(fill = "#071c2e", color = NA),
-      panel.background = element_rect(fill = "#071c2e", color = NA),
-      panel.grid.major = element_line(color = "rgba(20,200,180,0.07)", linewidth = 0.4),
-      panel.grid.minor = element_blank(),
-      text             = element_text(color = "#b8d4ea"),
-      axis.text        = element_text(color = "#6a9cbd"),
-      axis.title       = element_text(color = "#6a9cbd"),
-      plot.title       = element_text(color = "#eef6ff", face = "bold", size = 15),
-      plot.subtitle    = element_text(color = "#6a9cbd", size = 11),
-      plot.caption     = element_text(color = "#6a9cbd", size = 9),
-      legend.background = element_rect(fill = "#071c2e", color = NA),
-      legend.text      = element_text(color = "#b8d4ea"),
-      legend.title     = element_text(color = "#6a9cbd"),
-      strip.text       = element_text(color = "#eef6ff", face = "bold")
-    )
-}
-
-TEAL  <- "#14c8b4"
-AMBER <- "#fbbf24"
-RED   <- "#f87171"
-
-# =============================================================================
-# INSIGHT 01 — Medicaid Metro Gap
-# Urban Medicaid acceptance is 10× lower than micropolitan
-# =============================================================================
-
-ins_summary <- df |>
-  group_by(rurality) |>
-  summarise(
-    pct_insurance  = mean(pct_insurance_acceptance, na.rm = TRUE),
-    pct_medicaid   = mean(pct_medicaid,             na.rm = TRUE),
-    pct_sliding    = mean(pct_sliding_scale,        na.rm = TRUE),
-    .groups = "drop"
-  ) |>
-  pivot_longer(-rurality, names_to = "type", values_to = "pct") |>
-  mutate(
-    type = factor(type,
-      levels = c("pct_insurance","pct_medicaid","pct_sliding"),
-      labels = c("Insurance Acceptance","Medicaid Acceptance","Sliding Scale")
-    )
-  )
-
-p1 <- ggplot(ins_summary, aes(x = rurality, y = pct, fill = type)) +
-  geom_col(position = "dodge", width = 0.65, alpha = 0.9) +
-  scale_fill_manual(values = c(TEAL, RED, "#a78bfa")) +
-  scale_y_continuous(labels = percent_format(scale = 1), limits = c(0, 75)) +
-  labs(
-    title    = "Insurance Acceptance by Rurality",
-    subtitle = "Urban Medicaid acceptance (1.3%) is 10× lower than micropolitan (13.0%)",
-    x = NULL, y = "% of Providers", fill = NULL,
-    caption  = "Source: Two Dimensions of Access, OSF v1.0 (Jan 2026)"
-  ) +
-  theme_mh() +
   theme(legend.position = "bottom")
 
-ggsave(here("figures", "01_medicaid_metro_gap.png"), p1,
-       width = 9, height = 6, dpi = 180, bg = "#071c2e")
+print(fig1)
+# ggsave("figures/fig1_insurance_acceptance.png", fig1, width = 8, height = 5, dpi = 150)
 
-cat("✓ Figure 1: Medicaid metro gap saved\n")
 
-# =============================================================================
-# INSIGHT 02 — Affordability Paradox
-# Rural counties: highest fees, lowest income
-# =============================================================================
+# ── 5. Figure 2: Fee Burden vs. Disposable Income (Insight 3) ────────────────
+# Insight 3: In the Most Constrained Counties, 10 Sessions Cost Nearly 10%
 
-fee_summary <- df |>
-  group_by(rurality) |>
-  summarise(
-    median_fee    = median(median_fee,         na.rm = TRUE),
-    median_income = median(disposable_income,  na.rm = TRUE),
-    avg_burden    = mean(fee_burden_pct,       na.rm = TRUE),
-    .groups = "drop"
-  )
-
-p2 <- ggplot(df, aes(x = rurality, y = median_fee, fill = rurality)) +
-  geom_boxplot(alpha = 0.8, outlier.color = "#f87171", outlier.size = 2) +
-  geom_hline(yintercept = 130, linetype = "dashed", color = "#6a9cbd", linewidth = 0.6) +
-  annotate("text", x = 3.4, y = 132, label = "National median ($130)",
-           color = "#6a9cbd", size = 3.2, hjust = 1) +
-  scale_fill_manual(values = c(TEAL, AMBER, "#4ade80")) +
-  scale_y_continuous(labels = dollar_format()) +
+fig2 <- ggplot(
+  df,
+  aes(x = disposable_income, y = burden_10sess_pct, color = urban_rural, label = county)
+) +
+  geom_point(size = 3, alpha = 0.85) +
+  geom_hline(yintercept = 5, linetype = "dashed", color = "grey50", linewidth = 0.5) +
+  scale_x_continuous(labels = dollar_format(scale = 1e-3, suffix = "K")) +
+  scale_y_continuous(labels = percent_format(scale = 1)) +
+  scale_color_manual(values = c(Urban = "#4A6FA5", Micro = "#9C5CC0", Rural = "#C47B3A")) +
   labs(
-    title    = "Session Fees by Rurality",
-    subtitle = "Rural counties charge the highest median fee despite lower incomes",
-    x = NULL, y = "Median Session Fee",
-    caption  = "Source: Two Dimensions of Access, OSF v1.0 (Jan 2026)"
-  ) +
-  theme_mh() +
-  theme(legend.position = "none")
-
-ggsave(here("figures", "02_affordability_paradox.png"), p2,
-       width = 9, height = 6, dpi = 180, bg = "#071c2e")
-
-cat("✓ Figure 2: Affordability paradox saved\n")
-
-# =============================================================================
-# INSIGHT 03 — Fee Burden Scatter
-# ~10% of annual income for 10 sessions in most constrained counties
-# =============================================================================
-
-top_labels <- df |>
-  arrange(desc(fee_burden_pct)) |>
-  slice_head(n = 8)
-
-p3 <- ggplot(df, aes(x = disposable_income, y = fee_burden_pct, color = rurality)) +
-  geom_point(size = 3, alpha = 0.8) +
-  geom_label_repel(
-    data      = top_labels,
-    aes(label = str_remove(county_name, " County")),
-    size = 3, fill = "#0e2d44", color = "#eef6ff",
-    box.padding = 0.4, max.overlaps = 10
-  ) +
-  scale_color_manual(values = c(TEAL, AMBER, "#4ade80")) +
-  scale_x_continuous(labels = dollar_format()) +
-  scale_y_continuous(labels = function(x) paste0(x, "%")) +
-  labs(
-    title    = "Fee Burden by Disposable Income",
-    subtitle = "10 sessions as % of annual disposable income — Sierra County reaches 9.7%",
-    x = "Disposable Income", y = "Fee Burden (10 Sessions)",
+    title    = "10-Session Therapy Burden vs. Disposable Income by County",
+    subtitle = "Figure 2 — Dashed line = 5% burden threshold",
+    x        = "Median Disposable Income",
+    y        = "10-Session Cost as % of Disposable Income",
     color    = NULL,
-    caption  = "Source: Two Dimensions of Access, OSF v1.0 (Jan 2026)"
+    caption  = "Source: Two Dimensions of Access (OSF, v1.0, Jan 2026)"
   ) +
-  theme_mh() +
+  theme_minimal(base_size = 13) +
   theme(legend.position = "bottom")
 
-ggsave(here("figures", "03_fee_burden_scatter.png"), p3,
-       width = 10, height = 7, dpi = 180, bg = "#071c2e")
+print(fig2)
+# ggsave("figures/fig2_fee_burden_scatter.png", fig2, width = 9, height = 6, dpi = 150)
 
-cat("✓ Figure 3: Fee burden scatter saved\n")
 
-# =============================================================================
-# INSIGHT 04 — AVI Distribution by Rurality
-# Micropolitan counties have the lowest median provider density
-# =============================================================================
+# ── 6. Access Vulnerability Index Summary (Insight 4) ────────────────────────
+# Insight 4: Access Deserts Cluster in the Northern Interior and Central Valley
 
-p4 <- ggplot(df, aes(x = rurality, y = AVI_county, fill = rurality)) +
-  geom_boxplot(alpha = 0.8, outlier.color = "#f87171", outlier.size = 2) +
-  scale_fill_manual(values = c(TEAL, AMBER, "#4ade80")) +
-  scale_y_continuous(labels = comma_format()) +
-  labs(
-    title    = "Provider Availability Index (AVI) by Rurality",
-    subtitle = "Micropolitan counties show lowest median AVI (providers per 100K residents)",
-    x = NULL, y = "AVI",
-    caption  = "Source: Two Dimensions of Access, OSF v1.0 (Jan 2026)"
-  ) +
-  theme_mh() +
-  theme(legend.position = "none")
+avi_summary <- df |>
+  arrange(avi) |>
+  select(county, urban_rural, avi, afi, population) |>
+  mutate(
+    access_desert = avi <= 40,
+    population    = comma(population)
+  )
 
-ggsave(here("figures", "04_avi_by_rurality.png"), p4,
-       width = 9, height = 6, dpi = 180, bg = "#071c2e")
+# Counties classified as access deserts (AVI ≤ 40)
+cat("\n--- Access Desert Counties (AVI ≤ 40) ---\n")
+avi_summary |> filter(access_desert) |> print(n = Inf)
 
-cat("✓ Figure 4: AVI boxplot saved\n")
 
-# =============================================================================
-# Summary table (console)
-# =============================================================================
+# ── 7. Policy Implications Summary (Insight 5) ───────────────────────────────
+# For reporting / export — mirrors the three policy cards in index.html
 
-cat("\n── Summary by rurality ─────────────────────────────────────────────\n")
-df |>
-  group_by(rurality) |>
-  summarise(
-    n_counties     = n(),
-    median_fee     = median(median_fee,         na.rm = TRUE),
-    median_income  = median(disposable_income,  na.rm = TRUE),
-    avg_burden_pct = mean(fee_burden_pct,       na.rm = TRUE),
-    avg_medicaid   = mean(pct_medicaid,         na.rm = TRUE),
-    median_avi     = median(AVI_county,         na.rm = TRUE),
-    .groups = "drop"
-  ) |>
-  print(width = Inf)
+policy_summary <- tibble::tribble(
+  ~card, ~title,                                ~headline_stat,              ~implication,
+  "01",  "The Urban Medicaid Crisis",            "38.8M affected; 1.3% acceptance",
+         "Medi-Cal rate reform needed to unlock urban Medicaid supply.",
+  "02",  "The Rural Fee Paradox",                "$167.50 median fee; 4.9% income burden",
+         "Workforce incentives must address both supply and fee accessibility.",
+  "03",  "Access Deserts Are Geographic",        "AVI ≤ 40 in Northern Interior & Central Valley",
+         "Overlap with agricultural communities, high poverty, limited transit."
+)
 
-cat("\n── Session info ────────────────────────────────────────────────────\n")
-sessionInfo()
+print(policy_summary)
+
+
+# ── 8. Export Summary CSV ─────────────────────────────────────────────────────
+# Uncomment to write outputs
+# write_csv(summary_by_type, "outputs/table1_summary_by_type.csv")
+# write_csv(avi_summary,     "outputs/avi_county_level.csv")
+
+message("\nAnalysis complete. Review figures and summary tables above.")
+message("Source: Two Dimensions of Access (OSF, v1.0, Jan 2026)")
+message("Author: Pallavi Singh | 2026")
